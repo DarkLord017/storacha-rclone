@@ -1,0 +1,15 @@
+{
+  "name": "storacha-rclone-backend",
+  "version": "1.0.0",
+  "description": "Storacha backend for rclone",
+  "main": "sdk-wrapper.js",
+  "scripts": {
+    "bundle": "node bundle.js"
+  },
+  "dependencies": {
+    "@storacha/client": "^2.0.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.2"
+  }
+}
