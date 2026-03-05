@@ -117,6 +117,7 @@ directories to and from different cloud storage providers.
 - SMB / CIFS [:page_facing_up:](https://rclone.org/smb/)
 - Spectra Logic [:page_facing_up:](https://rclone.org/s3/#spectralogic)
 - StackPath [:page_facing_up:](https://rclone.org/s3/#stackpath)
+- Storacha [:page_facing_up:](https://rclone.org/storacha/)
 - Storj [:page_facing_up:](https://rclone.org/storj/)
 - SugarSync [:page_facing_up:](https://rclone.org/sugarsync/)
 - Synology C2 Object Storage [:page_facing_up:](https://rclone.org/s3/#synology-c2)

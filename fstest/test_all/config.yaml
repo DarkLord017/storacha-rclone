@@ -609,6 +609,9 @@ backends:
      - KRB5_CONFIG=/tmp/rclone_krb5_ccache/krb5.conf
    ignoretests:
      - cmd/gitannex
+ - backend:  "storacha"
+   remote:   "TestStoracha:"
+   fastlist: false
  - backend:  "storj"
    remote:   "TestStorj:"
    fastlist: true

@@ -313,6 +313,8 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}
 	}
 
+	fs.Debugf(f, "List dir=%q fullPath=%q", dir, fullPath)
+
 	resp, err := f.node.Call("list", map[string]string{
 		"path": fullPath,
 	})
@@ -321,6 +323,13 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	}
 
 	if !resp.Success {
+		// Check if it's a "not a directory" error
+		if resp.Error != "" && (len(resp.Error) > 15 && resp.Error[:15] == "Not a directory") {
+			return nil, fs.ErrorIsFile
+		}
+		if resp.Error != "" && (len(resp.Error) > 18 && resp.Error[:18] == "Directory not found") {
+			return nil, fs.ErrorDirNotFound
+		}
 		return nil, fmt.Errorf("list failed: %s", resp.Error)
 	}
 
@@ -343,7 +352,8 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}
 
 		if item.IsDir {
-			entries = append(entries, fs.NewDir(remote, time.Time{}))
+			modTime, _ := time.Parse(time.RFC3339, item.ModTime)
+			entries = append(entries, fs.NewDir(remote, modTime))
 		} else {
 			modTime, _ := time.Parse(time.RFC3339, item.ModTime)
 			entries = append(entries, &Object{
@@ -356,14 +366,23 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}
 	}
 
+	fs.Debugf(f, "List found %d entries", len(entries))
 	return entries, nil
 }
 
 // NewObject finds an object by remote path
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	fs.Debugf(f, "NewObject remote=%q", remote)
+
+	// Combine root and remote to get the full path
+	fullPath := remote
+	if f.root != "" {
+		fullPath = f.root + "/" + remote
+	}
+
 	// Query the bridge for file info
 	resp, err := f.node.Call("stat", map[string]string{
-		"name": remote,
+		"name": fullPath,
 	})
 	if err != nil {
 		return nil, err
@@ -377,6 +396,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		Found   bool   `json:"found"`
 		CID     string `json:"cid"`
 		Size    int64  `json:"size"`
+		IsDir   bool   `json:"isDir"`
 		ModTime string `json:"modTime"`
 	}
 	if err := json.Unmarshal(resp.Result, &result); err != nil {
@@ -385,6 +405,12 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 	if !result.Found {
 		return nil, fs.ErrorObjectNotFound
+	}
+
+	// If remote points to a directory, return ErrorIsDir
+	if result.IsDir {
+		fs.Debugf(f, "NewObject: %q is a directory", remote)
+		return nil, fs.ErrorIsDir
 	}
 
 	modTime, _ := time.Parse(time.RFC3339, result.ModTime)
@@ -434,13 +460,55 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	}, nil
 }
 
-// Mkdir creates a directory (no-op for Storacha)
+// Mkdir creates a directory
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	// Combine root and dir to get the full path
+	fullPath := dir
+	if f.root != "" {
+		if dir != "" {
+			fullPath = f.root + "/" + dir
+		} else {
+			fullPath = f.root
+		}
+	}
+
+	resp, err := f.node.Call("mkdir", map[string]string{
+		"path": fullPath,
+	})
+	if err != nil {
+		return fmt.Errorf("mkdir failed: %w", err)
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("mkdir failed: %s", resp.Error)
+	}
+
 	return nil
 }
 
-// Rmdir removes a directory (no-op for Storacha)
+// Rmdir removes a directory
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
+	// Combine root and dir to get the full path
+	fullPath := dir
+	if f.root != "" {
+		if dir != "" {
+			fullPath = f.root + "/" + dir
+		} else {
+			fullPath = f.root
+		}
+	}
+
+	resp, err := f.node.Call("rmdir", map[string]string{
+		"path": fullPath,
+	})
+	if err != nil {
+		return fmt.Errorf("rmdir failed: %w", err)
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("rmdir failed: %s", resp.Error)
+	}
+
 	return nil
 }
 

@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
+	
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -53,6 +54,7 @@ func RegisterHash(name, alias string, width int, newFunc func() hash.Hash) Type 
 
 	type2hash[hashType] = definition
 	name2hash[name] = definition
+
 	alias2hash[alias] = definition
 
 	return hashType
