@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -462,19 +463,33 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 // Mkdir creates a directory
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	// Combine root and dir to get the full path
-	fullPath := dir
-	if f.root != "" {
-		if dir != "" {
-			fullPath = f.root + "/" + dir
-		} else {
-			fullPath = f.root
-		}
+	// Handle empty directory (root) - root always exists, just succeed
+	if dir == "" {
+		return nil
 	}
 
-	resp, err := f.node.Call("mkdir", map[string]string{
-		"path": fullPath,
+	// split root and dir
+	var rootcid string
+	var subdir string
+	if f.root != "" {
+		result := strings.Split(dir, "/") // Ensure dir is split correctly
+		if len(result) > 1 {
+			rootcid = result[0]
+			subdir = strings.Join(result[1:], "/")
+		} else {
+			rootcid = dir
+			subdir = ""
+		}
+	} else {
+		return fmt.Errorf("invalid directory path: %q", dir)
+	}
+
+	resp, err := f.node.Call("mkdir", map[string]interface{}{
+		"cid":  rootcid,
+		"path": subdir,
+		"name": filepath.Base(dir),
 	})
+
 	if err != nil {
 		return fmt.Errorf("mkdir failed: %w", err)
 	}
@@ -488,19 +503,58 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 
 // Rmdir removes a directory
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	// Combine root and dir to get the full path
-	fullPath := dir
-	if f.root != "" {
-		if dir != "" {
-			fullPath = f.root + "/" + dir
-		} else {
-			fullPath = f.root
+	// Handle empty directory (root) - check if it's empty
+	if dir == "" {
+		// Get all root uploads
+		resp, err := f.node.Call("list", map[string]string{
+			"path": "",
+		})
+		if err != nil {
+			return fmt.Errorf("rmdir root failed: %w", err)
 		}
+		if !resp.Success {
+			return fmt.Errorf("rmdir root failed: %s", resp.Error)
+		}
+
+		// Parse the list to find all uploads
+		var items []struct {
+			CID string `json:"cid"`
+		}
+		if err := json.Unmarshal(resp.Result, &items); err != nil {
+			return fmt.Errorf("failed to parse uploads: %w", err)
+		}
+
+		// If no uploads found, return directory not found error
+		if len(items) == 0 {
+			return fs.ErrorDirNotFound
+		}
+
+		// If there are files, the directory is not empty
+		return fs.ErrorDirectoryNotEmpty
 	}
 
-	resp, err := f.node.Call("rmdir", map[string]string{
-		"path": fullPath,
+	// split root and dir
+	var rootcid string
+	var subdir string
+	if f.root != "" {
+		result := strings.Split(dir, "/") // Ensure dir is split correctly
+		if len(result) > 1 {
+			rootcid = result[0]
+			subdir = strings.Join(result[1:], "/")
+		} else {
+			rootcid = dir
+			subdir = ""
+		}
+	} else {
+		return fmt.Errorf("invalid directory path: %q", dir)
+	}
+
+	resp, err := f.node.Call("rmdir", map[string]interface{}{
+		"cid":  rootcid,
+		"path": subdir,
+		"name": filepath.Base(dir),
 	})
+
 	if err != nil {
 		return fmt.Errorf("rmdir failed: %w", err)
 	}

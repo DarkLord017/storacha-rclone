@@ -9,10 +9,84 @@ import { UnixFS } from 'ipfs-unixfs';
 import { CID } from 'multiformats/cid';
 import { sha256 } from 'multiformats/hashes/sha2';
 import { CarWriter } from '@ipld/car';
-import * as Name from 'w3name'
+import * as Name from 'w3name';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 
 let client = null;
 let currentSpace = null;
+
+// W3name registry to track IPNS names by CID
+// Format: { "cid": { name: Name, ipnsName: string, keyFile: string } }
+const nameRegistry = new Map();
+
+// Directory to store w3name keys
+const W3NAME_DIR = path.join(os.homedir(), '.storacha-rclone', 'w3name-keys');
+
+// Ensure key storage directory exists
+async function ensureKeyDir() {
+  try {
+    await fs.promises.mkdir(W3NAME_DIR, { recursive: true });
+  } catch (error) {
+    console.error(`[w3name] Warning: Could not create key directory: ${error.message}`);
+  }
+}
+
+// Save a w3name key to disk
+async function saveNameKey(cid, name) {
+  try {
+    await ensureKeyDir();
+    const keyFile = path.join(W3NAME_DIR, `${cid}.key`);
+    await fs.promises.writeFile(keyFile, name.key.bytes);
+    console.error(`[w3name] Saved key for CID ${cid} to ${keyFile}`);
+    return keyFile;
+  } catch (error) {
+    console.error(`[w3name] Error saving key: ${error.message}`);
+    return null;
+  }
+}
+
+// Load a w3name key from disk
+async function loadNameKey(cid) {
+  try {
+    const keyFile = path.join(W3NAME_DIR, `${cid}.key`);
+    const bytes = await fs.promises.readFile(keyFile);
+    const name = await Name.from(bytes);
+    console.error(`[w3name] Loaded key for CID ${cid} from ${keyFile}`);
+    return { name, keyFile };
+  } catch (error) {
+    // Don't log error - it's normal for keys to not exist
+    return null;
+  }
+}
+
+// Load all existing keys on startup
+async function loadAllKeys() {
+  try {
+    await ensureKeyDir();
+    const files = await fs.promises.readdir(W3NAME_DIR);
+    
+    for (const file of files) {
+      if (file.endsWith('.key')) {
+        const cid = file.replace('.key', '');
+        const result = await loadNameKey(cid);
+        if (result) {
+          nameRegistry.set(cid, {
+            name: result.name,
+            ipnsName: result.name.toString(),
+            keyFile: result.keyFile
+          });
+        }
+      }
+    }
+    if (nameRegistry.size > 0) {
+      console.error(`[w3name] Loaded ${nameRegistry.size} keys from ${W3NAME_DIR}`);
+    }
+  } catch (error) {
+    console.error(`[w3name] Error loading keys: ${error.message}`);
+  }
+}
 
 // Read JSON requests from stdin, write JSON responses to stdout
 const rl = readline.createInterface({
@@ -29,7 +103,7 @@ export const handlers = {
       client = await Client.create();
       
       // Login if email provided and not already logged in
-      if (email) {
+      if (email && typeof email === 'string' && email.trim() !== '') {
         const accounts = client.accounts();
         if (Object.keys(accounts).length === 0) {
           console.error(`[storacha] Logging in with email: ${email}`);
@@ -38,32 +112,16 @@ export const handlers = {
         }
       }
       
-      // Set space if provided
-      if (spaceDID) {
-        const spaces = client.spaces();
-        currentSpace = spaces.find(s => s.did() === spaceDID);
-        
-        if (currentSpace) {
-          await client.setCurrentSpace(spaceDID);
-        } else {
-          // Space not found, might need to claim delegations
-          console.error(`[storacha] Space ${spaceDID} not found locally, claiming delegations...`);
-          await client.capability.access.claim();
-          
-          // Try again
-          const updatedSpaces = client.spaces();
-          currentSpace = updatedSpaces.find(s => s.did() === spaceDID);
-          
-          if (currentSpace) {
-            await client.setCurrentSpace(spaceDID);
-          } else {
-            throw new Error(`Space ${spaceDID} not found. Available spaces: ${updatedSpaces.map(s => s.did()).join(', ')}`);
-          }
-        }
-        
-      }
+      currentSpace = await client.createSpace('rclone-space');
+      const newSpaceDID = spaceDID;
       
-      return { initialized: true, spaceDID: currentSpace?.did() };
+      // Set it as the current space
+      await client.setCurrentSpace(newSpaceDID);
+      
+      // Load existing w3name keys from disk
+      await loadAllKeys();
+      
+      return { initialized: true, spaceDID: newSpaceDID };
     } catch (error) {
       throw new Error(`Init failed: ${error.message}`);
     }
@@ -96,11 +154,25 @@ export const handlers = {
     });
     
     const rootCid = await client.uploadDirectory(fileObjects);
-    const ipnsName = await Name.create()
-    const value = '/ipfs/' + rootCid.toString()
-    const revision = await Name.v0(ipnsName , value)
-    await Name.publish(revision , ipnsName.key)
-    return { cid: rootCid.toString(), name: ipnsName.toString() };
+    const cidStr = rootCid.toString();
+    
+    // Create new w3name for this CID and save it
+    const name = await Name.create();
+    const ipnsName = name.toString();
+    const revision = await Name.v0(name, rootCid);
+    await Name.publish(revision, name.key);
+    
+    // Save to registry and disk
+    const keyFile = await saveNameKey(cidStr, name);
+    nameRegistry.set(cidStr, {
+      name: name,
+      ipnsName: ipnsName,
+      keyFile: keyFile
+    });
+    
+    console.error(`[w3name] Created and published ${ipnsName} for CID ${cidStr}`);
+    
+    return { cid: cidStr, name: ipnsName };
   },
   
   async list({ path: dirPath }) {
@@ -648,6 +720,37 @@ export const handlers = {
     await client.capability.upload.add(newRootCID, allShards);
     console.error(`Registered new root ${newRootCID} with ${allShards.length} shards (${originalUpload.shards.length} original + 1 new)`);
 
+    // Check if old CID has a w3name - if so, create revision to update IPNS pointer
+    const oldCIDStr = cid.toString();
+    if (nameRegistry.has(oldCIDStr)) {
+      try {
+        const nameInfo = nameRegistry.get(oldCIDStr);
+        const nameInstance = await loadNameKey(nameInfo.keyFile);
+        
+        // Publish revision pointing new CID to the same IPNS name
+        const revision = await Name.v0(nameInstance, newRootCID);
+        await Name.publish(revision, nameInstance.key);
+        
+        // Update registry with new CID
+        nameRegistry.delete(oldCIDStr);
+        nameRegistry.set(newRootCID.toString(), {
+          name: nameInfo.name,
+          ipnsName: nameInfo.ipnsName,
+          keyFile: nameInfo.keyFile
+        });
+        
+        // Update key file to point to new CID
+        await saveNameKey(newRootCID.toString(), nameInstance);
+        
+        console.error(`[mkdir] Published w3name revision: ${nameInfo.ipnsName} -> ${newRootCID}`);
+      } catch (err) {
+        console.error(`[mkdir] Failed to update w3name revision: ${err.message}`);
+      }
+    } else {
+      console.error(`[mkdir] No w3name key found for old CID ${oldCIDStr}. IPNS pointer not updated.`);
+      console.error(`[mkdir] To enable IPNS updates, load the key file from ${W3NAME_DIR}`);
+    }
+
     return { newRootCID: newRootCID.toString() };
   },
 
@@ -794,6 +897,37 @@ export const handlers = {
     ];
     await client.capability.upload.add(newRootCID, allShards);
     console.error(`[rmdir] Registered new root ${newRootCID} with ${allShards.length} shards`);
+
+    // Check if old CID has a w3name - if so, create revision to update IPNS pointer
+    const oldCIDStr = cid.toString();
+    if (nameRegistry.has(oldCIDStr)) {
+      try {
+        const nameInfo = nameRegistry.get(oldCIDStr);
+        const nameInstance = await loadNameKey(nameInfo.keyFile);
+        
+        // Publish revision pointing new CID to the same IPNS name
+        const revision = await Name.v0(nameInstance, newRootCID);
+        await Name.publish(revision, nameInstance.key);
+        
+        // Update registry with new CID
+        nameRegistry.delete(oldCIDStr);
+        nameRegistry.set(newRootCID.toString(), {
+          name: nameInfo.name,
+          ipnsName: nameInfo.ipnsName,
+          keyFile: nameInfo.keyFile
+        });
+        
+        // Update key file to point to new CID
+        await saveNameKey(newRootCID.toString(), nameInstance);
+        
+        console.error(`[rmdir] Published w3name revision: ${nameInfo.ipnsName} -> ${newRootCID}`);
+      } catch (err) {
+        console.error(`[rmdir] Failed to update w3name revision: ${err.message}`);
+      }
+    } else {
+      console.error(`[rmdir] No w3name key found for old CID ${oldCIDStr}. IPNS pointer not updated.`);
+      console.error(`[rmdir] To enable IPNS updates, load the key file from ${W3NAME_DIR}`);
+    }
 
     return { newRootCID: newRootCID.toString() };
   },
