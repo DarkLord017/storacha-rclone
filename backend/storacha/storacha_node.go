@@ -21,11 +21,13 @@ import (
 
 // Fs represents a Storacha filesystem backed by Node.js subprocess
 type Fs struct {
-	name     string
-	root     string
-	spaceDID string
-	email    string
-	node     *NodeBridge
+	name       string
+	root       string
+	spaceDID   string
+	email      string
+	privateKey string
+	proofPath  string
+	node       *NodeBridge
 }
 
 // Object represents a file stored in Storacha
@@ -77,7 +79,17 @@ func init() {
 			},
 			{
 				Name:     "email",
-				Help:     "Email for Storacha authentication.",
+				Help:     "Email for Storacha authentication (used when private_key is not set).",
+				Required: false,
+			},
+			{
+				Name:     "private_key",
+				Help:     "Ed25519 private key for UCAN key-based authentication (base64 encoded, starts with Mg...).",
+				Required: false,
+			},
+			{
+				Name:     "proof_path",
+				Help:     "Path to proof.ucan delegation file for UCAN key-based authentication.",
 				Required: false,
 			},
 		},
@@ -199,6 +211,8 @@ func (n *NodeBridge) Close() error {
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	spaceDID, _ := m.Get("space_did")
 	email, _ := m.Get("email")
+	privateKey, _ := m.Get("private_key")
+	proofPath, _ := m.Get("proof_path")
 
 	if spaceDID == "" {
 		return nil, fmt.Errorf("storacha: space_did is required")
@@ -211,18 +225,41 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	f := &Fs{
-		name:     name,
-		root:     root,
-		spaceDID: spaceDID,
-		email:    email,
-		node:     node,
+		name:       name,
+		root:       root,
+		spaceDID:   spaceDID,
+		email:      email,
+		privateKey: privateKey,
+		proofPath:  proofPath,
+		node:       node,
+	}
+
+	// Build init params based on auth mode
+	initParams := map[string]string{
+		"spaceDID": spaceDID,
+	}
+
+	if privateKey != "" && proofPath != "" {
+		// UCAN key-based authentication
+		absProofPath, err := filepath.Abs(proofPath)
+		if err != nil {
+			node.Close()
+			return nil, fmt.Errorf("failed to resolve proof path: %w", err)
+		}
+		if _, err := os.Stat(absProofPath); err != nil {
+			node.Close()
+			return nil, fmt.Errorf("proof file not found at %s: %w", absProofPath, err)
+		}
+		initParams["privateKey"] = privateKey
+		initParams["proofPath"] = absProofPath
+		fs.Logf(f, "Using UCAN key-based authentication")
+	} else if email != "" {
+		initParams["email"] = email
+		fs.Logf(f, "Using email-based authentication")
 	}
 
 	// Initialize the client
-	resp, err := node.Call("init", map[string]string{
-		"spaceDID": spaceDID,
-		"email":    email,
-	})
+	resp, err := node.Call("init", initParams)
 	if err != nil {
 		node.Close()
 		return nil, fmt.Errorf("failed to initialize: %w", err)
@@ -451,6 +488,8 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	if err := json.Unmarshal(resp.Result, &result); err != nil {
 		return nil, fmt.Errorf("failed to parse upload result: %w", err)
 	}
+
+	fs.Logf(f, "Uploaded %s -> CID: %s", src.Remote(), result.CID)
 
 	return &Object{
 		fs:      f,
