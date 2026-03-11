@@ -109,12 +109,17 @@ export const handlers = {
         const store = new StoreMemory();
         client = await Client.create({ principal, store });
         
-        // Read and parse the proof file (supports base64 text)
+        // Read and parse the proof file (supports both base64 text and binary CAR)
         const rawBytes = await fs.promises.readFile(proofPath);
         let proof;
         if (rawBytes[0] < 0x80 && !rawBytes.includes(0)) {
           // Looks like text (base64-encoded) — use text parser
           proof = await parseProofText(rawBytes.toString('utf-8').trim());
+        } else {
+          // Binary CAR data — use Delegation.extract
+          const result = await extractDelegation(new Uint8Array(rawBytes));
+          if (!result.ok) throw new Error(`Failed to extract delegation: ${result.error?.message}`);
+          proof = result.ok;
         }
         
         const space = await client.addSpace(proof);
