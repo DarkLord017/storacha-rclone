@@ -3,6 +3,10 @@
 // This script runs as a subprocess and communicates via stdin/stdout JSON
 
 import * as Client from '@storacha/client';
+import { StoreMemory } from '@storacha/client/stores/memory';
+import { parse as parseProofText } from '@storacha/client/proof';
+import { extract as extractDelegation } from '@storacha/client/delegation';
+import * as Signer from '@ucanto/principal/ed25519';
 import * as readline from 'readline';
 import * as dagPB from '@ipld/dag-pb';
 import { UnixFS } from 'ipfs-unixfs';
@@ -97,31 +101,33 @@ const rl = readline.createInterface({
 
 // Handler functions
 export const handlers = {
-  async init({ spaceDID, email }) {
+  async init({ spaceDID, email, privateKey, proofPath }) {
     try {
-      // Create client
-      client = await Client.create();
-      
-      // Login if email provided and not already logged in
-      if (email && typeof email === 'string' && email.trim() !== '') {
-        const accounts = client.accounts();
-        if (Object.keys(accounts).length === 0) {
-          console.error(`[storacha] Logging in with email: ${email}`);
-          await client.login(email);
-          console.error('[storacha] Check your email to authorize this agent');
+      if (privateKey && proofPath) {
+        // UCAN key-based authentication
+        const principal = Signer.parse(privateKey);
+        const store = new StoreMemory();
+        client = await Client.create({ principal, store });
+        
+        // Read and parse the proof file (supports base64 text)
+        const rawBytes = await fs.promises.readFile(proofPath);
+        let proof;
+        if (rawBytes[0] < 0x80 && !rawBytes.includes(0)) {
+          // Looks like text (base64-encoded) — use text parser
+          proof = await parseProofText(rawBytes.toString('utf-8').trim());
         }
+        
+        const space = await client.addSpace(proof);
+        await client.setCurrentSpace(space.did());
+        currentSpace = space;
+        
+        console.log(`[storacha] UCAN auth initialized, space: ${space.did()}`);
       }
-      
-      currentSpace = await client.createSpace('rclone-space');
-      const newSpaceDID = spaceDID;
-      
-      // Set it as the current space
-      await client.setCurrentSpace(newSpaceDID);
       
       // Load existing w3name keys from disk
       await loadAllKeys();
       
-      return { initialized: true, spaceDID: newSpaceDID };
+      return { initialized: true, spaceDID: spaceDID };
     } catch (error) {
       throw new Error(`Init failed: ${error.message}`);
     }
