@@ -127,6 +127,23 @@ export const handlers = {
         currentSpace = space;
         
         console.log(`[storacha] UCAN auth initialized, space: ${space.did()}`);
+      } else {
+        // Email-based authentication (fallback flow)
+        client = await Client.create();
+        
+        if (email && typeof email === 'string' && email.trim() !== '') {
+          const accounts = client.accounts();
+          if (Object.keys(accounts).length === 0) {
+            console.error(`[storacha] Logging in with email: ${email}`);
+            await client.login(email);
+            console.error('[storacha] Check your email to authorize this agent');
+          }
+        }
+        
+        currentSpace = await client.createSpace('rclone-space');
+        await client.setCurrentSpace(spaceDID);
+        
+        console.log(`[storacha] Email auth initialized, space: ${spaceDID}`);
       }
       
       // Load existing w3name keys from disk
