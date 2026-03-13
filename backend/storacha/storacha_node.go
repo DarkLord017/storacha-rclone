@@ -463,16 +463,28 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 // Put uploads a file
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	// Read file data
-	data, err := io.ReadAll(in)
+	// stream to temp file instead of buffering entire file in memory
+	// this decreases memory usage in loading into head, encoding, pipe write and then node also holds it in memory
+	tmpFile, err := os.CreateTemp("", "rclone-storacha-upload-*")
 	if err != nil {
-		return nil, fmt.Errorf("failed to read data: %w", err)
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	written, err := io.Copy(tmpFile, in)
+	if err != nil {
+		tmpFile.Close()
+		return nil, fmt.Errorf("failed to write temp file: %w", err)
+	}
+	tmpFile.Close()
+
+	fs.Logf(f, "Streaming upload: %s (%d bytes via temp file)", src.Remote(), written)
 
 	resp, err := f.node.Call("upload", map[string]interface{}{
-		"name": src.Remote(),
-		"data": data, // Will be base64 encoded by JSON
-		"size": src.Size(),
+		"name":     src.Remote(),
+		"filePath": tmpPath,
+		"size":     written,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("upload failed: %w", err)

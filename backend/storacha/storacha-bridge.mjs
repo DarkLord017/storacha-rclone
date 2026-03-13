@@ -126,7 +126,7 @@ export const handlers = {
         await client.setCurrentSpace(space.did());
         currentSpace = space;
         
-        console.log(`[storacha] UCAN auth initialized, space: ${space.did()}`);
+        console.error(`[storacha] UCAN auth initialized, space: ${space.did()}`);
       } else {
         // Email-based authentication (fallback flow)
         client = await Client.create();
@@ -143,7 +143,7 @@ export const handlers = {
         currentSpace = await client.createSpace('rclone-space');
         await client.setCurrentSpace(spaceDID);
         
-        console.log(`[storacha] Email auth initialized, space: ${spaceDID}`);
+        console.error(`[storacha] Email auth initialized, space: ${spaceDID}`);
       }
       
       // Load existing w3name keys from disk
@@ -155,20 +155,29 @@ export const handlers = {
     }
   },
   
-  async upload({ name, data, size }) {
+  async upload({ name, data, filePath, size }) {
     if (!client) throw new Error('Client not initialized');
     if (!currentSpace) throw new Error('No space selected');
-    
-    // data comes as base64 from Go's JSON encoding of []byte
-    const buffer = Buffer.from(data, 'base64');
+
+    // data comes as filepath from tmp file (for better memory usage)
+    let buffer;
+    if (filePath) {
+      buffer = await fs.promises.readFile(filePath);
+    } else if (data) {
+      buffer = Buffer.from(data, 'base64');
+    } else {
+      throw new Error('Either filePath or data is required');
+    }
+
     const file = new File([buffer], name, { type: 'application/octet-stream' });
     
     const cid = await client.uploadFile(file);
     const cidStr = cid.toString();
-    
-    return { 
+
+    console.error(`[storacha] Upload complete: ${cidStr}`);
+    return {
       cid: cidStr,
-      size: buffer.length 
+      size: buffer.length
     };
   },
   
