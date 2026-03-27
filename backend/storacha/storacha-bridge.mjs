@@ -53,9 +53,10 @@ async function loadNameKey(cid) {
     const keyFile = path.join(W3NAME_DIR, `${cid}.key`);
     const bytes = await fs.promises.readFile(keyFile);
     const name = await Name.from(bytes);
-    console.error(`[w3name] Loaded key for CID ${cid} from ${keyFile}`);
+    console.error(`[w3name] Loaded key for CID ${cid} from $ || []{keyFile}`);
     return { name, keyFile };
   } catch (error) {
+        consol
     // Don't log error - it's normal for keys to not exist
     return null;
   }
@@ -131,7 +132,7 @@ export const handlers = {
     if (!client) throw new Error('Client not initialized');
     if (!currentSpace) throw new Error('No space selected');
     
-    // data comes as base64 from Go's JSON encoding of []byte
+    console.error(`[storacha] upload called with name: "${name}", size: ${size} bytes (base64 length: ${data.length})`);
     const buffer = Buffer.from(data, 'base64');
     const file = new File([buffer], name, { type: 'application/octet-stream' });
     
@@ -231,12 +232,23 @@ export const handlers = {
     const subPath = parts.slice(1);
     
     console.error(`[storacha] Root CID: ${rootCID}, subPath: ${subPath.join('/')}`);
-    
+    // List all links in the directory
+    const entries = [];
     // Fetch the root DAG node
     let currentNode;
     try {
       currentNode = await handlers.fetchDag(rootCID);
     } catch (error) {
+      if (subPath.length == 0) {
+        entries.push({
+          name: rootCID,
+          cid: rootCID,
+          size: 0,
+          isDir: false,
+          modTime: new Date().toISOString()
+        })
+        return entries;
+      }
       console.error(`[storacha] Failed to fetch root CID: ${error.message}`);
       throw new Error(`Directory not found: ${cid}`);
     }
@@ -268,8 +280,6 @@ export const handlers = {
       throw new Error(`Not a directory: ${cid}`);
     }
     
-    // List all links in the directory
-    const entries = [];
     for (const link of currentNode.Links) {
       const linkCID = link.Hash.toString();
       
@@ -318,7 +328,7 @@ export const handlers = {
       console.error(`[storacha] Root CID: ${rootCID}, subPath: ${subPath.join('/')}`);
       
       // First check if this root CID exists in uploads (for root-level files)
-      if (subPath.length === 0) {
+      if (subPath.length <= 1) {
         const upload = await handlers.findUploadByCID(rootCID);
         if (upload) {
           return {
@@ -396,29 +406,88 @@ export const handlers = {
     }
   },
 
-  async findUploadByCID(cid) {
-    let cursor;
-    do {
-      const res = await client.capability.upload.list({ cursor });
-      if (!res || !res.results) break;
-      
-      for (const upload of res.results) {
-        const rootCID = upload.root.toString();
-        if (rootCID === cid) {
-          const size = upload.shards?.reduce((sum, s) => sum + (s.size || 0), 0) || 0;
-          return {
-            cid: rootCID,
-            size: size,
-            modTime: upload.insertedAt || new Date().toISOString()
-          };
+async findUploadByCID(cid) {
+  let cursor;
+  do {
+    const res = await client.capability.upload.list({ cursor });
+    if (!res || !res.results) break;
+
+    for (const upload of res.results) {
+      const rootCID = upload.root.toString();
+      if (rootCID === cid) {
+        let size = -1;
+        try {
+          const shardEntries = [];
+          /** @type {string|undefined} */
+          let shardCursor;
+          // eslint-disable-next-line no-constant-condition
+          while (true) {
+            const page = await client.capability.upload.shard.list(upload.root, { cursor: shardCursor });
+            shardEntries.push(...(page.results || []));
+            shardCursor = page.cursor;
+            if (!shardCursor) {
+              break;
+            }
+          }
+
+          console.error(`[storacha] Found ${shardEntries.length} shards for CID ${cid}`);
+
+          if (shardEntries.length > 0) {
+            let total = 0;
+
+            for (const shard of shardEntries) {
+              // CID.decode() turns the raw multihash Uint8Array into a proper CID
+              const shardCID = CID.decode(shard["/"]);
+              const shardMHBytes = shardCID.multihash.bytes;
+              const shardCIDStr = shardCID.toString();
+              console.error(`[storacha] Looking for shard: ${shardCIDStr}`);
+
+              let blobCursor;
+              let found = false;
+              do {
+                const blobPage = await client.capability.blob.list({ cursor: blobCursor });
+                for (const item of (blobPage.results ?? [])) {
+                  const digestArr = item.blob.digest;
+                  const match =
+                    digestArr.length === shardMHBytes.length &&
+                    digestArr.every((b, i) => b === shardMHBytes[i]);
+                  if (match) {
+                    total += item.blob.size ?? 0;
+                    found = true;
+                    break;
+                  }
+                }
+                if (found) break;
+                blobCursor = blobPage.cursor;
+              } while (blobCursor);
+
+              if (!found) {
+                console.error(`[storacha] WARNING: shard ${shardCIDStr} not found in blob.list`);
+                console.error(`[storacha] shardMHBytes:`, JSON.stringify(Array.from(shardMHBytes)));
+              }
+            }
+
+            size = total;
+          }
+        } catch (error) {
+          console.error(`[storacha] Error occurred while fetching shard information for CID ${cid}: ${error.message}`);
         }
+
+        console.error(`[storacha] first shard complete json metadata for CID ${cid}: ${JSON.stringify(upload)}`);
+        console.error(`[storacha] Found upload for CID ${cid} with size ${size}`);
+        return {
+          cid: rootCID,
+          size: size,
+          modTime: upload.insertedAt || new Date().toISOString()
+        };
       }
-      
-      cursor = res.cursor;
-    } while (cursor);
-    
-    return null;
-  },
+    }
+
+    cursor = res.cursor;
+  } while (cursor);
+
+  return null;
+},
   
   async download({ cid }) {
     if (!client) throw new Error('Client not initialized');
@@ -659,7 +728,11 @@ export const handlers = {
     }
 
     const newRootCID = updated.cid;
-    console.error(`New root CID: ${newRootCID}`);
+    const newRootCIDStr = newRootCID?.toString();
+    if (!newRootCIDStr) {
+      throw new Error('mkdir failed: missing newRootCID');
+    }
+    console.error(`New root CID: ${newRootCIDStr}`);
 
     // ── 6. Build and upload a CAR containing only the changed blocks ──────
     const { writer, out } = await CarWriter.create([newRootCID]);
@@ -718,7 +791,7 @@ export const handlers = {
       normaliseCID(newShardCID)
     ];
     await client.capability.upload.add(newRootCID, allShards);
-    console.error(`Registered new root ${newRootCID} with ${allShards.length} shards (${originalUpload.shards.length} original + 1 new)`);
+    console.error(`Registered new root ${newRootCIDStr} with ${allShards.length} shards (${originalUpload.shards.length} original + 1 new)`);
 
     // Check if old CID has a w3name - if so, create revision to update IPNS pointer
     const oldCIDStr = cid.toString();
@@ -733,16 +806,16 @@ export const handlers = {
         
         // Update registry with new CID
         nameRegistry.delete(oldCIDStr);
-        nameRegistry.set(newRootCID.toString(), {
+        nameRegistry.set(newRootCIDStr, {
           name: nameInfo.name,
           ipnsName: nameInfo.ipnsName,
           keyFile: nameInfo.keyFile
         });
         
         // Update key file to point to new CID
-        await saveNameKey(newRootCID.toString(), nameInstance);
+        await saveNameKey(newRootCIDStr, nameInstance);
         
-        console.error(`[mkdir] Published w3name revision: ${nameInfo.ipnsName} -> ${newRootCID}`);
+        console.error(`[mkdir] Published w3name revision: ${nameInfo.ipnsName} -> ${newRootCIDStr}`);
       } catch (err) {
         console.error(`[mkdir] Failed to update w3name revision: ${err.message}`);
       }
@@ -751,7 +824,7 @@ export const handlers = {
       console.error(`[mkdir] To enable IPNS updates, load the key file from ${W3NAME_DIR}`);
     }
 
-    return { newRootCID: newRootCID.toString() };
+    return { newRootCID: newRootCIDStr };
   },
 
   /**
@@ -847,7 +920,11 @@ export const handlers = {
     }
 
     const newRootCID = updated.cid;
-    console.error(`[rmdir] New root CID: ${newRootCID}`);
+    const newRootCIDStr = newRootCID?.toString();
+    if (!newRootCIDStr) {
+      throw new Error('[rmdir] failed: missing newRootCID');
+    }
+    console.error(`[rmdir] New root CID: ${newRootCIDStr}`);
 
     // ── 5. Build and upload a CAR of only the changed dag-pb nodes ────────
     const { writer, out } = await CarWriter.create([newRootCID]);
@@ -896,7 +973,7 @@ export const handlers = {
       normaliseCID(newShardCID)
     ];
     await client.capability.upload.add(newRootCID, allShards);
-    console.error(`[rmdir] Registered new root ${newRootCID} with ${allShards.length} shards`);
+    console.error(`[rmdir] Registered new root ${newRootCIDStr} with ${allShards.length} shards`);
 
     // Check if old CID has a w3name - if so, create revision to update IPNS pointer
     const oldCIDStr = cid.toString();
@@ -911,16 +988,16 @@ export const handlers = {
         
         // Update registry with new CID
         nameRegistry.delete(oldCIDStr);
-        nameRegistry.set(newRootCID.toString(), {
+        nameRegistry.set(newRootCIDStr, {
           name: nameInfo.name,
           ipnsName: nameInfo.ipnsName,
           keyFile: nameInfo.keyFile
         });
         
         // Update key file to point to new CID
-        await saveNameKey(newRootCID.toString(), nameInstance);
+        await saveNameKey(newRootCIDStr, nameInstance);
         
-        console.error(`[rmdir] Published w3name revision: ${nameInfo.ipnsName} -> ${newRootCID}`);
+        console.error(`[rmdir] Published w3name revision: ${nameInfo.ipnsName} -> ${newRootCIDStr}`);
       } catch (err) {
         console.error(`[rmdir] Failed to update w3name revision: ${err.message}`);
       }
@@ -929,7 +1006,7 @@ export const handlers = {
       console.error(`[rmdir] To enable IPNS updates, load the key file from ${W3NAME_DIR}`);
     }
 
-    return { newRootCID: newRootCID.toString() };
+    return { newRootCID: newRootCIDStr };
   },
 
   async createCAR({ rootCID, blocks }) {

@@ -9,8 +9,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -21,11 +21,14 @@ import (
 
 // Fs represents a Storacha filesystem backed by Node.js subprocess
 type Fs struct {
-	name     string
-	root     string
-	spaceDID string
-	email    string
-	node     *NodeBridge
+	name        string
+	remoteRoot  string
+	rootCID     string
+	spaceDID    string
+	email       string
+	node        *NodeBridge
+	fileCIDMap  map[string]string // Maps file path → root CID for tracking
+	fileCIDLock sync.RWMutex      // Protects fileCIDMap
 }
 
 // Object represents a file stored in Storacha
@@ -211,11 +214,13 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	f := &Fs{
-		name:     name,
-		root:     root,
-		spaceDID: spaceDID,
-		email:    email,
-		node:     node,
+		name:       name,
+		remoteRoot: path.Clean(root),
+		rootCID:    "",
+		spaceDID:   spaceDID,
+		email:      email,
+		node:       node,
+		fileCIDMap: make(map[string]string),
 	}
 
 	// Initialize the client
@@ -233,7 +238,54 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, fmt.Errorf("initialization failed: %s", resp.Error)
 	}
 
+	// Always fetch the actual root CID from Storacha, never use path-based root
+	if err := f.refreshRootCID(); err != nil {
+		node.Close()
+		return nil, err
+	}
+
 	return f, nil
+}
+
+func (f *Fs) refreshRootCID() error {
+	resp, err := f.node.Call("getRootCID", map[string]interface{}{})
+	if err != nil {
+		return fmt.Errorf("failed to get root CID: %w", err)
+	}
+	if !resp.Success {
+		return fmt.Errorf("failed to get root CID: %s", resp.Error)
+	}
+	var result struct {
+		RootCID string `json:"rootCID"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return fmt.Errorf("failed to parse root CID: %w", err)
+	}
+	if result.RootCID == "" {
+		return fmt.Errorf("failed to get root CID: empty rootCID")
+	}
+	f.rootCID = result.RootCID
+	return nil
+}
+
+// recordFileCID records the mapping from file path to root CID
+func (f *Fs) recordFileCID(filePath, cid string) {
+	f.fileCIDLock.Lock()
+	defer f.fileCIDLock.Unlock()
+	if cid != "" {
+		f.fileCIDMap[filePath] = cid
+	}
+}
+
+// GetFileCIDMapping returns a copy of the file-to-CID mapping for inspection
+func (f *Fs) GetFileCIDMapping() map[string]string {
+	f.fileCIDLock.RLock()
+	defer f.fileCIDLock.RUnlock()
+	mapping := make(map[string]string)
+	for k, v := range f.fileCIDMap {
+		mapping[k] = v
+	}
+	return mapping
 }
 
 // ------------------------------------------------------------
@@ -241,7 +293,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 // ------------------------------------------------------------
 
 func (f *Fs) Name() string   { return f.name }
-func (f *Fs) Root() string   { return f.root }
+func (f *Fs) Root() string   { return f.remoteRoot }
 func (f *Fs) String() string { return "storacha:" + f.spaceDID }
 
 func (f *Fs) Features() *fs.Features {
@@ -306,12 +358,14 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	// Combine root and dir to get the full path
 	fullPath := dir
-	if f.root != "" {
+	if f.rootCID != "" {
 		if dir != "" {
-			fullPath = f.root + "/" + dir
+			fullPath = f.rootCID + "/" + dir
 		} else {
-			fullPath = f.root
+			fullPath = f.rootCID
 		}
+	} else {
+		return nil, fmt.Errorf("failed to list: root not initialized")
 	}
 
 	fs.Debugf(f, "List dir=%q fullPath=%q", dir, fullPath)
@@ -373,12 +427,13 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 // NewObject finds an object by remote path
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	fs.Debugf(f, "NewObject remote=%q", remote)
 
 	// Combine root and remote to get the full path
 	fullPath := remote
-	if f.root != "" {
-		fullPath = f.root + "/" + remote
+	if f.rootCID != "" {
+		fullPath = f.rootCID + "/" + remote
+	} else {
+		return nil, fmt.Errorf("failed to stat: root not initialized")
 	}
 
 	// Query the bridge for file info
@@ -467,27 +522,22 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	if dir == "" {
 		return nil
 	}
-
-	// split root and dir
-	var rootcid string
-	var subdir string
-	if f.root != "" {
-		result := strings.Split(dir, "/") // Ensure dir is split correctly
-		if len(result) > 1 {
-			rootcid = result[0]
-			subdir = strings.Join(result[1:], "/")
-		} else {
-			rootcid = dir
-			subdir = ""
+	if f.rootCID == "" {
+		if err := f.refreshRootCID(); err != nil {
+			return fmt.Errorf("mkdir failed: %w", err)
 		}
-	} else {
-		return fmt.Errorf("invalid directory path: %q", dir)
 	}
 
+	parent := path.Dir(dir)
+	if parent == "." {
+		parent = ""
+	}
+	name := path.Base(dir)
+
 	resp, err := f.node.Call("mkdir", map[string]interface{}{
-		"cid":  rootcid,
-		"path": subdir,
-		"name": filepath.Base(dir),
+		"cid":  f.rootCID,
+		"path": parent,
+		"name": name,
 	})
 
 	if err != nil {
@@ -497,13 +547,28 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	if !resp.Success {
 		return fmt.Errorf("mkdir failed: %s", resp.Error)
 	}
-
+	var result struct {
+		NewRootCID string `json:"newRootCID"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return fmt.Errorf("mkdir failed to parse new root CID: %w", err)
+	}
+	if result.NewRootCID == "" {
+		return fmt.Errorf("mkdir failed: missing newRootCID")
+	}
+	f.rootCID = result.NewRootCID
+	// Record the mapping: dir path → rootCID
+	f.recordFileCID(dir, result.NewRootCID)
+    
 	return nil
 }
-
-// Rmdir removes a directory
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	// Handle empty directory (root) - check if it's empty
+	if f.rootCID == "" {
+		if err := f.refreshRootCID(); err != nil {
+			return fs.ErrorDirNotFound
+		}
+	}
 	if dir == "" {
 		// Get all root uploads
 		resp, err := f.node.Call("list", map[string]string{
@@ -533,26 +598,16 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return fs.ErrorDirectoryNotEmpty
 	}
 
-	// split root and dir
-	var rootcid string
-	var subdir string
-	if f.root != "" {
-		result := strings.Split(dir, "/") // Ensure dir is split correctly
-		if len(result) > 1 {
-			rootcid = result[0]
-			subdir = strings.Join(result[1:], "/")
-		} else {
-			rootcid = dir
-			subdir = ""
-		}
-	} else {
-		return fmt.Errorf("invalid directory path: %q", dir)
+	parent := path.Dir(dir)
+	if parent == "." {
+		parent = ""
 	}
+	name := path.Base(dir)
 
 	resp, err := f.node.Call("rmdir", map[string]interface{}{
-		"cid":  rootcid,
-		"path": subdir,
-		"name": filepath.Base(dir),
+		"cid":  f.rootCID,
+		"path": parent,
+		"name": name,
 	})
 
 	if err != nil {
@@ -562,6 +617,18 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	if !resp.Success {
 		return fmt.Errorf("rmdir failed: %s", resp.Error)
 	}
+	var result struct {
+		NewRootCID string `json:"newRootCID"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		return fmt.Errorf("rmdir failed to parse new root CID: %w", err)
+	}
+	if result.NewRootCID == "" {
+		return fmt.Errorf("rmdir failed: missing newRootCID")
+	}
+	f.rootCID = result.NewRootCID
+	// Record the mapping: dir path → rootCID
+	f.recordFileCID(dir, result.NewRootCID)
 
 	return nil
 }
