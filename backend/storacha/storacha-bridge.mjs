@@ -579,8 +579,9 @@ export const handlers = {
       const isDir = unixfs.type === 'directory';
       let size = 0;
       
-      if (!isDir && unixfs.data) {
-        size = unixfs.data.length;
+      if (!isDir) {
+        const fs = unixfs.fileSize();
+        size = fs ? Number(fs) : (unixfs.data?.length || 0);
       }
       
       return {
