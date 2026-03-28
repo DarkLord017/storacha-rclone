@@ -468,13 +468,12 @@ export const handlers = {
         const childUnixFS = UnixFS.unmarshal(childNode.Data);
         isDir = childUnixFS.type === 'directory';
         
-        // For files, get the actual data size (not Tsize which includes overhead)
-        if (!isDir && childUnixFS.data) {
-          size = childUnixFS.data.length;
+        if (!isDir) {
+          const fs = childUnixFS.fileSize();
+          size = fs ? Number(fs) : (link.Tsize || 0);
         }
       } catch (error) {
-        console.error(`[storacha] Warning: could not fetch child node ${linkCID}: ${error.message}`);
-        // Assume it's a file if we can't determine
+        // Raw blocks (from uploadFile) can't be decoded as dag-pb — that's fine, it's a file
         isDir = false;
       }
       
@@ -530,14 +529,32 @@ export const handlers = {
       }
       
       // Walk the subpath
-      for (const part of subPath) {
+      for (let i = 0; i < subPath.length; i++) {
+        const part = subPath[i];
         const link = currentNode.Links.find(l => l.Name === part);
         if (!link) {
           console.error(`[storacha] Path part not found: ${part}`);
           return { found: false };
         }
         currentCID = link.Hash.toString();
-        currentNode = await handlers.fetchDag(currentCID);
+        
+        try {
+          currentNode = await handlers.fetchDag(currentCID);
+        } catch (err) {
+          // Raw block CID (from uploadFile) — can't decode as dag-pb.
+          // If this is the last path segment, it's a file — return using link metadata.
+          if (i === subPath.length - 1) {
+            return {
+              found: true,
+              name: name,
+              cid: currentCID,
+              size: link.Tsize || 0,
+              isDir: false,
+              modTime: new Date().toISOString()
+            };
+          }
+          throw err;
+        }
       }
       
       // Parse UnixFS to determine type and size
@@ -546,7 +563,6 @@ export const handlers = {
         unixfs = UnixFS.unmarshal(currentNode.Data);
       } catch (error) {
         console.error(`[storacha] Failed to parse UnixFS: ${error.message}`);
-        // If we can't parse but have links, assume directory
         if (currentNode.Links.length > 0) {
           return {
             found: true,
