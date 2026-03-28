@@ -171,12 +171,16 @@ export const handlers = {
       throw new Error('Either filePath or data is required');
     }
 
-    // ── 1. Create the dag-pb file block ───────────────────────────────────
-    const unixfsFile = new UnixFS({ type: 'file', data: buffer });
-    const fileNodeData = dagPB.prepare({ Data: unixfsFile.marshal(), Links: [] });
-    const fileBytes = dagPB.encode(fileNodeData);
-    const fileHash = await sha256.digest(fileBytes);
-    const fileCID = CID.create(1, dagPB.code, fileHash);
+    // ── 1. Upload file data via client (handles chunking & sharding for large files) ──
+    const fileBlob = new Blob([buffer]);
+    const fileShardCIDs = [];
+    const fileCID = await client.uploadFile(fileBlob, {
+      onShardStored: meta => {
+        fileShardCIDs.push(meta.cid);
+        console.error(`[storacha] File shard stored: ${meta.cid}`);
+      }
+    });
+    console.error(`[storacha] File uploaded: CID=${fileCID}, shards=${fileShardCIDs.length}`);
 
     // ── 2. Parse the file path ────────────────────────────────────────────
     const parts = name.split('/').filter(Boolean);
