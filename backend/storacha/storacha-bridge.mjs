@@ -247,15 +247,15 @@ export const handlers = {
     }
 
     // ── 5. Insert the file link into the target directory ─────────────────
+    const fileCIDObj = typeof fileCID === 'string' ? CID.parse(fileCID) : CID.parse(fileCID.toString());
     let updated = await handlers.rebuildDirNode(currentNode, {
       name: fileName,
-      cid: fileCID,
+      cid: fileCIDObj,
       size: buffer.length
     });
 
     // ── 6. Collect all new/modified blocks ───────────────────────────────
     const blocksToWrite = [
-      { cid: fileCID, bytes: Buffer.from(fileBytes) },
       { cid: updated.cid, bytes: updated.bytes }
     ];
 
@@ -289,21 +289,19 @@ export const handlers = {
     await readerPromise;
 
     const carBytes = Buffer.concat(chunks);
-    console.error(`[storacha] Uploading CAR (${carBytes.length} bytes) for "${name}"...`);
+    console.error(`[storacha] Uploading directory CAR (${carBytes.length} bytes) for "${name}"...`);
 
     const carBlob = new Blob([carBytes], { type: 'application/car' });
-    let newShardCID;
+    const dirShardCIDs = [];
     await client.uploadCAR(carBlob, {
       rootCID: newRootCID,
       onShardStored: meta => {
-        newShardCID = meta.cid;
-        console.error(`[storacha] New shard CID: ${newShardCID}`);
+        dirShardCIDs.push(meta.cid);
+        console.error(`[storacha] Dir shard CID: ${meta.cid}`);
       }
     });
 
-    if (!newShardCID) throw new Error('Failed to get shard CID from CAR upload');
-
-    // ── 9. Register new root = old shards + new shard ─────────────────────
+    // ── 9. Register new root = old shards + file shards + dir shards ─────
     const normaliseCID = (s) => {
       if (s && s.constructor?.name === 'CID') return s;
       if (s && s.cid) return typeof s.cid === 'string' ? CID.parse(s.cid) : s.cid;
@@ -311,9 +309,9 @@ export const handlers = {
       return CID.parse(s.toString());
     };
     const oldShards = originalUpload?.shards ? originalUpload.shards.map(normaliseCID) : [];
-    const allShards = [...oldShards, normaliseCID(newShardCID)];
+    const allShards = [...oldShards, ...fileShardCIDs.map(normaliseCID), ...dirShardCIDs.map(normaliseCID)];
     await client.capability.upload.add(newRootCID, allShards);
-    console.error(`[storacha] Registered new root ${newRootCIDStr} with ${allShards.length} shards (${oldShards.length} original + 1 new)`);
+    console.error(`[storacha] Registered new root ${newRootCIDStr} with ${allShards.length} shards (${oldShards.length} old + ${fileShardCIDs.length} file + ${dirShardCIDs.length} dir)`);
 
     return {
       cid: fileCID.toString(),
@@ -1351,15 +1349,36 @@ async findUploadByCID(cid) {
     if (!currentSpace) throw new Error('No space selected');
 
     try {
-      // Get the most recent upload's root CID
-      const res = await client.capability.upload.list({ cursor: undefined });
+      let cursor;
+      do {
+        const res = await client.capability.upload.list({ cursor });
+        if (!res || !res.results || res.results.length === 0) break;
 
-      if (res && res.results && res.results.length > 0) {
-        const latestUpload = res.results[0];
-        return { rootCID: latestUpload.root.toString() };
-      }
+        for (const upload of res.results) {
+          const rootStr = upload.root.toString();
+          // Only dag-pb CIDs can be directory roots; skip raw blocks and others
+          try {
+            const cidObj = CID.parse(rootStr);
+            if (cidObj.code !== dagPB.code) continue;
+          } catch { continue; }
 
-      // No uploads yet — return empty string; the backend will create a root on first write
+          // Verify it's actually a directory node
+          try {
+            const node = await handlers.fetchDag(rootStr);
+            const uf = UnixFS.unmarshal(node.Data);
+            if (uf.type === 'directory') {
+              console.error(`[storacha] Found directory root: ${rootStr}`);
+              return { rootCID: rootStr };
+            }
+          } catch (e) {
+            console.error(`[storacha] Skipping root ${rootStr}: ${e.message}`);
+            continue;
+          }
+        }
+
+        cursor = res.cursor;
+      } while (cursor);
+
       return { rootCID: '' };
     } catch (error) {
       throw new Error(`Failed to get root CID: ${error.message}`);
