@@ -3,6 +3,10 @@
 // This script runs as a subprocess and communicates via stdin/stdout JSON
 
 import * as Client from '@storacha/client';
+import { StoreMemory } from '@storacha/client/stores/memory';
+import { parse as parseProofText } from '@storacha/client/proof';
+import { extract as extractDelegation } from '@storacha/client/delegation';
+import * as Signer from '@ucanto/principal/ed25519';
 import * as readline from 'readline';
 import * as dagPB from '@ipld/dag-pb';
 import { UnixFS } from 'ipfs-unixfs';
@@ -53,10 +57,9 @@ async function loadNameKey(cid) {
     const keyFile = path.join(W3NAME_DIR, `${cid}.key`);
     const bytes = await fs.promises.readFile(keyFile);
     const name = await Name.from(bytes);
-    console.error(`[w3name] Loaded key for CID ${cid} from $ || []{keyFile}`);
+    console.error(`[w3name] Loaded key for CID ${cid} from ${keyFile}`);
     return { name, keyFile };
   } catch (error) {
-        consol
     // Don't log error - it's normal for keys to not exist
     return null;
   }
@@ -98,42 +101,75 @@ const rl = readline.createInterface({
 
 // Handler functions
 export const handlers = {
-  async init({ spaceDID, email }) {
+  async init({ spaceDID, email, privateKey, proofPath }) {
     try {
-      // Create client
-      client = await Client.create();
-      
-      // Login if email provided and not already logged in
-      if (email && typeof email === 'string' && email.trim() !== '') {
-        const accounts = client.accounts();
-        if (Object.keys(accounts).length === 0) {
-          console.error(`[storacha] Logging in with email: ${email}`);
-          await client.login(email);
-          console.error('[storacha] Check your email to authorize this agent');
+      if (privateKey && proofPath) {
+        // UCAN key-based authentication
+        const principal = Signer.parse(privateKey);
+        const store = new StoreMemory();
+        client = await Client.create({ principal, store });
+        
+        // Read and parse the proof file (supports both base64 text and binary CAR)
+        const rawBytes = await fs.promises.readFile(proofPath);
+        let proof;
+        if (rawBytes[0] < 0x80 && !rawBytes.includes(0)) {
+          // Looks like text (base64-encoded) — use text parser
+          proof = await parseProofText(rawBytes.toString('utf-8').trim());
+        } else {
+          // Binary CAR data — use Delegation.extract
+          const result = await extractDelegation(new Uint8Array(rawBytes));
+          if (!result.ok) throw new Error(`Failed to extract delegation: ${result.error?.message}`);
+          proof = result.ok;
         }
+        
+        const space = await client.addSpace(proof);
+        await client.setCurrentSpace(space.did());
+        currentSpace = space;
+        
+        console.error(`[storacha] UCAN auth initialized, space: ${space.did()}`);
+      } else {
+        // Email-based authentication (fallback flow)
+        client = await Client.create();
+        
+        if (email && typeof email === 'string' && email.trim() !== '') {
+          const accounts = client.accounts();
+          if (Object.keys(accounts).length === 0) {
+            console.error(`[storacha] Logging in with email: ${email}`);
+            await client.login(email);
+            console.error('[storacha] Check your email to authorize this agent');
+          }
+        }
+        
+        currentSpace = await client.createSpace('rclone-space');
+        await client.setCurrentSpace(spaceDID);
+        
+        console.error(`[storacha] Email auth initialized, space: ${spaceDID}`);
       }
-      
-      currentSpace = await client.createSpace('rclone-space');
-      const newSpaceDID = spaceDID;
-      
-      // Set it as the current space
-      await client.setCurrentSpace(newSpaceDID);
       
       // Load existing w3name keys from disk
       await loadAllKeys();
       
-      return { initialized: true, spaceDID: newSpaceDID };
+      return { initialized: true, spaceDID: spaceDID };
     } catch (error) {
       throw new Error(`Init failed: ${error.message}`);
     }
   },
   
-  async upload({ name, data, size, rootCID }) {
+  async upload({ name, data, filePath, size, rootCID }) {
     if (!client) throw new Error('Client not initialized');
     if (!currentSpace) throw new Error('No space selected');
 
     console.error(`[storacha] upload called with name: "${name}", size: ${size} bytes`);
-    const buffer = Buffer.from(data, 'base64');
+
+    // Read buffer from filePath if available (memory efficient), otherwise fall back to base64 data
+    let buffer;
+    if (filePath) {
+      buffer = await fs.promises.readFile(filePath);
+    } else if (data) {
+      buffer = Buffer.from(data, 'base64');
+    } else {
+      throw new Error('Either filePath or data is required');
+    }
 
     // ── 1. Create the dag-pb file block ───────────────────────────────────
     const unixfsFile = new UnixFS({ type: 'file', data: buffer });
@@ -463,7 +499,22 @@ export const handlers = {
       
       console.error(`[storacha] Root CID: ${rootCID}, subPath: ${subPath.join('/')}`);
       
-      // Traverse the DAG tree to find the node at the given path
+      // First check if this root CID exists in uploads (for root-level files)
+      if (subPath.length === 0) {
+        const upload = await handlers.findUploadByCID(rootCID);
+        if (upload) {
+          return {
+            found: true,
+            name: rootCID,
+            cid: rootCID,
+            size: upload.size,
+            isDir: false,
+            modTime: upload.modTime
+          };
+        }
+      }
+      
+      // Try to fetch as DAG and traverse path
       let currentNode;
       let currentCID = rootCID;
       

@@ -26,6 +26,8 @@ type Fs struct {
 	rootCID     string
 	spaceDID    string
 	email       string
+	privateKey  string
+	proofPath   string
 	node        *NodeBridge
 	fileCIDMap  map[string]string // Maps file path → root CID for tracking
 	fileCIDLock sync.RWMutex      // Protects fileCIDMap
@@ -81,7 +83,17 @@ func init() {
 			},
 			{
 				Name:     "email",
-				Help:     "Email for Storacha authentication.",
+				Help:     "Email for Storacha authentication (used when private_key is not set).",
+				Required: false,
+			},
+			{
+				Name:     "private_key",
+				Help:     "Ed25519 private key for UCAN key-based authentication (base64 encoded, starts with Mg...).",
+				Required: false,
+			},
+			{
+				Name:     "proof_path",
+				Help:     "Path to proof.ucan delegation file for UCAN key-based authentication.",
 				Required: false,
 			},
 		},
@@ -203,6 +215,8 @@ func (n *NodeBridge) Close() error {
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	spaceDID, _ := m.Get("space_did")
 	email, _ := m.Get("email")
+	privateKey, _ := m.Get("private_key")
+	proofPath, _ := m.Get("proof_path")
 
 	if spaceDID == "" {
 		return nil, fmt.Errorf("storacha: space_did is required")
@@ -220,15 +234,38 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		rootCID:    "",
 		spaceDID:   spaceDID,
 		email:      email,
+		privateKey: privateKey,
+		proofPath:  proofPath,
 		node:       node,
 		fileCIDMap: make(map[string]string),
 	}
 
-	// Initialize the client
-	resp, err := node.Call("init", map[string]string{
+	// Build init params based on auth mode
+	initParams := map[string]string{
 		"spaceDID": spaceDID,
-		"email":    email,
-	})
+	}
+
+	if privateKey != "" && proofPath != "" {
+		// UCAN key-based authentication
+		absProofPath, err := filepath.Abs(proofPath)
+		if err != nil {
+			node.Close()
+			return nil, fmt.Errorf("failed to resolve proof path: %w", err)
+		}
+		if _, err := os.Stat(absProofPath); err != nil {
+			node.Close()
+			return nil, fmt.Errorf("proof file not found at %s: %w", absProofPath, err)
+		}
+		initParams["privateKey"] = privateKey
+		initParams["proofPath"] = absProofPath
+		fs.Logf(f, "Using UCAN key-based authentication")
+	} else if email != "" {
+		initParams["email"] = email
+		fs.Logf(f, "Using email-based authentication")
+	}
+
+	// Initialize the client
+	resp, err := node.Call("init", initParams)
 	if err != nil {
 		node.Close()
 		return nil, fmt.Errorf("failed to initialize: %w", err)
@@ -479,11 +516,23 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 // Put uploads a file into the DAG tree and updates the root CID.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	// Read file data before acquiring the lock to minimise lock hold time.
-	data, err := io.ReadAll(in)
+	// stream to temp file instead of buffering entire file in memory
+	// this decreases memory usage in loading into head, encoding, pipe write and then node also holds it in memory
+	tmpFile, err := os.CreateTemp("", "rclone-storacha-upload-*")
 	if err != nil {
-		return nil, fmt.Errorf("failed to read data: %w", err)
+		return nil, fmt.Errorf("failed to create temp file: %w", err)
 	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	written, err := io.Copy(tmpFile, in)
+	if err != nil {
+		tmpFile.Close()
+		return nil, fmt.Errorf("failed to write temp file: %w", err)
+	}
+	tmpFile.Close()
+
+	fs.Logf(f, "Streaming upload: %s (%d bytes via temp file)", src.Remote(), written)
 
 	// Serialise all root-modifying operations so concurrent transfers don't
 	// clobber each other's rootCID updates.
@@ -491,10 +540,10 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	defer f.rootMu.Unlock()
 
 	resp, err := f.node.Call("upload", map[string]interface{}{
-		"name":    src.Remote(),
-		"data":    data, // JSON-encoded as base64
-		"size":    src.Size(),
-		"rootCID": f.rootCID, // current root; bridge creates a fresh one if empty
+		"name":     src.Remote(),
+		"filePath": tmpPath,
+		"size":     written,
+		"rootCID":  f.rootCID, // current root; bridge creates a fresh one if empty
 	})
 	if err != nil {
 		return nil, fmt.Errorf("upload failed: %w", err)
@@ -517,6 +566,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		f.rootCID = result.NewRootCID
 		f.recordFileCID(src.Remote(), result.NewRootCID)
 	}
+	fs.Logf(f, "Uploaded %s -> CID: %s", src.Remote(), result.CID)
 
 	return &Object{
 		fs:      f,
