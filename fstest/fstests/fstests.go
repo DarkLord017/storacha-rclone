@@ -42,6 +42,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type contextKey string
+
+const useBackendReturnedRemoteContextKey contextKey = "fstests.useBackendReturnedRemote"
+
+func withUseBackendReturnedRemote(ctx context.Context, v bool) context.Context {
+	return context.WithValue(ctx, useBackendReturnedRemoteContextKey, v)
+}
+
+func useBackendReturnedRemote(ctx context.Context) bool {
+	v, _ := ctx.Value(useBackendReturnedRemoteContextKey).(bool)
+	return v
+}
+
 // InternalTester is an optional interface for Fs which allows to execute internal tests
 //
 // This interface should be implemented in 'backend'_internal_test.go and not in 'backend'.go
@@ -185,6 +198,12 @@ func PutTestContentsMetadata(ctx context.Context, t *testing.T, f fs.Fs, file *f
 			obji.WithMetadata(metadata).WithMimeType(mimeType)
 		}
 		obj, err = f.Put(ctx, in, obji, options...)
+		if err == nil && useBackendReturnedRemote(ctx) {
+			remote := obj.Remote()
+			if remote != "" {
+				file.Path = remote
+			}
+		}
 		return err
 	})
 	file.Hashes = uploadHash.Sums()
@@ -303,6 +322,7 @@ type ExtraConfigItem struct{ Name, Key, Value string }
 type Opt struct {
 	RemoteName                      string
 	NilObject                       fs.Object
+	UseBackendReturnedRemote        bool // if set, use the object Remote() returned by Put/Update as canonical path in tests (e.g. CID-based backends)
 	ExtraConfig                     []ExtraConfigItem
 	SkipBadWindowsCharacters        bool     // skips unusable characters for windows if set
 	SkipFsMatch                     bool     // if set skip exact matching of Fs value
@@ -379,6 +399,7 @@ func Run(t *testing.T, opt *Opt) {
 		ci                   = fs.GetConfig(ctx)
 		unwrappableFsMethods = []string{"Command"} // these Fs methods don't need to be wrapped ever
 	)
+	ctx = withUseBackendReturnedRemote(ctx, opt.UseBackendReturnedRemote)
 
 	if strings.HasSuffix(os.Getenv("RCLONE_CONFIG"), "/notfound") && *fstest.RemoteName == "" && !opt.QuickTestOK {
 		t.Skip("quicktest only")
@@ -452,8 +473,13 @@ func Run(t *testing.T, opt *Opt) {
 	// subRemoteName - name of the remote after the TestRemote:
 	// subRemoteLeaf - a subdirectory to use under that
 	// remote - the result of  fs.NewFs(TestRemote:subRemoteName)
-	subRemoteName, subRemoteLeaf, err = fstest.RandomRemoteName(remoteName)
-	require.NoError(t, err)
+	if opt.UseBackendReturnedRemote {
+		subRemoteName = remoteName
+		subRemoteLeaf = ""
+	} else {
+		subRemoteName, subRemoteLeaf, err = fstest.RandomRemoteName(remoteName)
+		require.NoError(t, err)
+	}
 	f, err = fs.NewFs(context.Background(), subRemoteName)
 	if errors.Is(err, fs.ErrorNotFoundInConfigFile) {
 		t.Logf("Didn't find %q in config file - skipping tests", remoteName)
@@ -710,7 +736,7 @@ func Run(t *testing.T, opt *Opt) {
 						ModTime: time.Now(),
 						Path:    dirName + "/" + fileName, // test creating a file and dir with that name
 					}
-					_, o := testPut(context.Background(), t, f, &file)
+					_, o := testPut(ctx, t, f, &file)
 					fstest.CheckListingWithPrecision(t, f, []fstest.Item{file}, []string{dirName}, fs.GetModifyWindow(ctx, f))
 					assert.NoError(t, o.Remove(ctx))
 					assert.NoError(t, f.Rmdir(ctx, dirName))
@@ -1047,7 +1073,9 @@ func Run(t *testing.T, opt *Opt) {
 				require.NoError(t, err)
 				_, dirs, err := walk.GetAll(ctx, rootRemote, "", true, 1)
 				require.NoError(t, err)
-				assert.Contains(t, dirsToNames(dirs), subRemoteLeaf, "Remote leaf not found")
+				if subRemoteLeaf != "" {
+					assert.Contains(t, dirsToNames(dirs), subRemoteLeaf, "Remote leaf not found")
+				}
 			}
 			t.Run("FsListDirRoot", TestFsListDirRoot)
 
