@@ -128,20 +128,156 @@ export const handlers = {
     }
   },
   
-  async upload({ name, data, size }) {
+  async upload({ name, data, size, rootCID }) {
     if (!client) throw new Error('Client not initialized');
     if (!currentSpace) throw new Error('No space selected');
-    
-    console.error(`[storacha] upload called with name: "${name}", size: ${size} bytes (base64 length: ${data.length})`);
+
+    console.error(`[storacha] upload called with name: "${name}", size: ${size} bytes`);
     const buffer = Buffer.from(data, 'base64');
-    const file = new File([buffer], name, { type: 'application/octet-stream' });
-    
-    const cid = await client.uploadFile(file);
-    const cidStr = cid.toString();
-    
-    return { 
-      cid: cidStr,
-      size: buffer.length 
+
+    // ── 1. Create the dag-pb file block ───────────────────────────────────
+    const unixfsFile = new UnixFS({ type: 'file', data: buffer });
+    const fileNodeData = dagPB.prepare({ Data: unixfsFile.marshal(), Links: [] });
+    const fileBytes = dagPB.encode(fileNodeData);
+    const fileHash = await sha256.digest(fileBytes);
+    const fileCID = CID.create(1, dagPB.code, fileHash);
+
+    // ── 2. Parse the file path ────────────────────────────────────────────
+    const parts = name.split('/').filter(Boolean);
+    const fileName = parts[parts.length - 1];
+    const dirParts = parts.slice(0, -1);
+
+    // ── 3. Locate (or create) a valid directory root ──────────────────────
+    let originalUpload = null;
+    let rootNode = null;
+
+    if (rootCID && rootCID !== '') {
+      try {
+        const uploads = await client.capability.upload.list();
+        originalUpload = uploads.results.find(u => u.root.toString() === rootCID) || null;
+        if (originalUpload) {
+          const node = await handlers.fetchDag(rootCID);
+          // Verify the root is actually a UnixFS directory
+          try {
+            const rootUnixfs = UnixFS.unmarshal(node.Data);
+            if (rootUnixfs.type === 'directory') {
+              rootNode = node;
+            } else {
+              console.error(`[storacha] Root ${rootCID} is a file node, not a directory — creating fresh root`);
+              originalUpload = null;
+            }
+          } catch (e) {
+            console.error(`[storacha] Root ${rootCID} UnixFS parse failed — creating fresh root`);
+            originalUpload = null;
+          }
+        }
+      } catch (e) {
+        console.error(`[storacha] Could not fetch root ${rootCID}: ${e.message} — creating fresh root`);
+        originalUpload = null;
+      }
+    }
+
+    if (!rootNode) {
+      // No valid root yet — start with an empty directory
+      const emptyUnixfs = new UnixFS({ type: 'directory' });
+      const emptyNode = dagPB.prepare({ Data: emptyUnixfs.marshal(), Links: [] });
+      const emptyBytes = dagPB.encode(emptyNode);
+      rootNode = dagPB.decode(emptyBytes);
+      originalUpload = null;
+      console.error(`[storacha] Created fresh empty root directory`);
+    }
+
+    // ── 4. Walk down the path, building a stack for the bubble-up pass ───
+    // If an intermediate directory is missing we create it in memory.
+    const stack = []; // [{ name, node }]
+    let currentNode = rootNode;
+
+    for (const dir of dirParts) {
+      const link = currentNode.Links.find(l => l.Name === dir);
+      stack.push({ name: dir, node: currentNode });
+      if (link) {
+        currentNode = await handlers.fetchDag(link.Hash.toString());
+      } else {
+        // Create an in-memory empty directory node
+        const emptyUnixfs = new UnixFS({ type: 'directory' });
+        const emptyNode = dagPB.prepare({ Data: emptyUnixfs.marshal(), Links: [] });
+        const emptyBytes = dagPB.encode(emptyNode);
+        currentNode = dagPB.decode(emptyBytes);
+      }
+    }
+
+    // ── 5. Insert the file link into the target directory ─────────────────
+    let updated = await handlers.rebuildDirNode(currentNode, {
+      name: fileName,
+      cid: fileCID,
+      size: buffer.length
+    });
+
+    // ── 6. Collect all new/modified blocks ───────────────────────────────
+    const blocksToWrite = [
+      { cid: fileCID, bytes: Buffer.from(fileBytes) },
+      { cid: updated.cid, bytes: updated.bytes }
+    ];
+
+    // ── 7. Bubble changes up through ancestor directories ─────────────────
+    while (stack.length > 0) {
+      const parent = stack.pop();
+      updated = await handlers.rebuildDirNode(parent.node, {
+        name: parent.name,
+        cid: updated.cid,
+        size: updated.bytes.length
+      });
+      blocksToWrite.push({ cid: updated.cid, bytes: updated.bytes });
+    }
+
+    const newRootCID = updated.cid;
+    const newRootCIDStr = newRootCID.toString();
+    console.error(`[storacha] New root CID after upload of "${name}": ${newRootCIDStr}`);
+
+    // ── 8. Build and upload a CAR with all new/changed blocks ─────────────
+    const { writer, out } = await CarWriter.create([newRootCID]);
+    const chunks = [];
+    const readerPromise = (async () => {
+      for await (const chunk of out) chunks.push(chunk);
+    })();
+
+    for (const block of blocksToWrite) {
+      const cidObj = typeof block.cid === 'string' ? CID.parse(block.cid) : block.cid;
+      await writer.put({ cid: cidObj, bytes: block.bytes });
+    }
+    await writer.close();
+    await readerPromise;
+
+    const carBytes = Buffer.concat(chunks);
+    console.error(`[storacha] Uploading CAR (${carBytes.length} bytes) for "${name}"...`);
+
+    const carBlob = new Blob([carBytes], { type: 'application/car' });
+    let newShardCID;
+    await client.uploadCAR(carBlob, {
+      rootCID: newRootCID,
+      onShardStored: meta => {
+        newShardCID = meta.cid;
+        console.error(`[storacha] New shard CID: ${newShardCID}`);
+      }
+    });
+
+    if (!newShardCID) throw new Error('Failed to get shard CID from CAR upload');
+
+    // ── 9. Register new root = old shards + new shard ─────────────────────
+    const normaliseCID = (s) => {
+      if (s && s.constructor?.name === 'CID') return s;
+      if (s && s.cid) return typeof s.cid === 'string' ? CID.parse(s.cid) : s.cid;
+      if (typeof s === 'string') return CID.parse(s);
+      return CID.parse(s.toString());
+    };
+    const oldShards = originalUpload?.shards ? originalUpload.shards.map(normaliseCID) : [];
+    const allShards = [...oldShards, normaliseCID(newShardCID)];
+    await client.capability.upload.add(newRootCID, allShards);
+    console.error(`[storacha] Registered new root ${newRootCIDStr} with ${allShards.length} shards (${oldShards.length} original + 1 new)`);
+
+    return {
+      cid: fileCID.toString(),
+      newRootCID: newRootCIDStr
     };
   },
   
@@ -327,22 +463,7 @@ export const handlers = {
       
       console.error(`[storacha] Root CID: ${rootCID}, subPath: ${subPath.join('/')}`);
       
-      // First check if this root CID exists in uploads (for root-level files)
-      if (subPath.length <= 1) {
-        const upload = await handlers.findUploadByCID(rootCID);
-        if (upload) {
-          return {
-            found: true,
-            name: rootCID,
-            cid: rootCID,
-            size: upload.size,
-            isDir: false,
-            modTime: upload.modTime
-          };
-        }
-      }
-      
-      // Try to fetch as DAG and traverse path
+      // Traverse the DAG tree to find the node at the given path
       let currentNode;
       let currentCID = rootCID;
       
@@ -506,23 +627,19 @@ async findUploadByCID(cid) {
     return { data };
   },
   
-  async remove({ cid }) {
+  async remove({ rootCID, path: filePath, name }) {
     if (!client) throw new Error('Client not initialized');
-    
-    try {
-      // Parse the root CID and remove the upload
-      const rootCID = CID.parse(cid);
-      const result = await client.capability.upload.remove(rootCID);
-      
-      if (result.error) {
-        throw new Error(`Remove failed: ${result.error.message}`);
-      }
-      
-      return { removed: true };
-    } catch (error) {
-      console.error(`[storacha] Remove failed for ${cid}: ${error.message}`);
-      throw error;
+    if (!currentSpace) throw new Error('No space selected');
+
+    if (!rootCID || rootCID === '') {
+      throw new Error('remove: rootCID is required');
     }
+
+    console.error(`[storacha] remove called: rootCID=${rootCID}, path="${filePath}", name="${name}"`);
+
+    // Reuse rmdir — it removes any named link (file or directory) from the DAG tree
+    // and returns the new root CID.
+    return handlers.rmdir({ cid: rootCID, path: filePath, name });
   },
 
   async copy({ cid, remote, size }) {
@@ -672,16 +789,46 @@ async findUploadByCID(cid) {
     if (!client) throw new Error('Client not initialized');
     if (!currentSpace) throw new Error('No space selected');
 
-    // ── 1. Locate the original upload record ──────────────────────────────
-    const uploads = await client.capability.upload.list();
-    console.error(`Looking for original upload with root CID ${cid} among ${uploads.results.length} uploads...`);
+    // ── 1. Locate the original upload record (if any) ─────────────────────
+    // If cid is empty, or the root is not a directory, start with a fresh root.
+    let originalUpload = null;
+    let currentNode = null;
 
-    const originalUpload = uploads.results.find(u => u.root.toString() === cid.toString());
-    if (!originalUpload) {
-      throw new Error(`Original upload with root ${cid} not found in your space.`);
+    if (cid && cid !== '') {
+      const uploads = await client.capability.upload.list();
+      console.error(`[mkdir] Looking for upload with root CID ${cid} among ${uploads.results.length} uploads...`);
+      originalUpload = uploads.results.find(u => u.root.toString() === cid.toString()) || null;
+      if (originalUpload) {
+        try {
+          const node = await handlers.fetchDag(cid);
+          try {
+            const rootUnixfs = UnixFS.unmarshal(node.Data);
+            if (rootUnixfs.type === 'directory') {
+              currentNode = node;
+            } else {
+              console.error(`[mkdir] Root ${cid} is a file node — creating fresh root`);
+              originalUpload = null;
+            }
+          } catch (e) {
+            console.error(`[mkdir] Root ${cid} UnixFS parse failed — creating fresh root`);
+            originalUpload = null;
+          }
+        } catch (e) {
+          console.error(`[mkdir] Could not fetch root ${cid}: ${e.message} — creating fresh root`);
+          originalUpload = null;
+        }
+      }
     }
 
-    const originalRootCID = CID.parse(cid);
+    if (!currentNode) {
+      // No valid root — start with an in-memory empty directory
+      const emptyUnixfs = new UnixFS({ type: 'directory' });
+      const emptyNode = dagPB.prepare({ Data: emptyUnixfs.marshal(), Links: [] });
+      const emptyBytes = dagPB.encode(emptyNode);
+      currentNode = dagPB.decode(emptyBytes);
+      originalUpload = null;
+      console.error(`[mkdir] Created fresh empty root directory`);
+    }
 
     // ── 2. Walk the path to the target parent node ────────────────────────
     const pathParts = (path === '' || path === '/')
@@ -689,7 +836,6 @@ async findUploadByCID(cid) {
       : path.split('/').filter(Boolean);
 
     const stack = []; // [{name, node}] breadcrumb trail from root down
-    let currentNode = await handlers.fetchDag(cid);
 
     for (const part of pathParts) {
       const link = currentNode.Links.find(l => l.Name === part);
@@ -786,12 +932,10 @@ async findUploadByCID(cid) {
       return CID.parse(s.toString());
     };
 
-    const allShards = [
-      ...originalUpload.shards.map(normaliseCID),
-      normaliseCID(newShardCID)
-    ];
+    const oldShards = originalUpload?.shards ? originalUpload.shards.map(normaliseCID) : [];
+    const allShards = [...oldShards, normaliseCID(newShardCID)];
     await client.capability.upload.add(newRootCID, allShards);
-    console.error(`Registered new root ${newRootCIDStr} with ${allShards.length} shards (${originalUpload.shards.length} original + 1 new)`);
+    console.error(`[mkdir] Registered new root ${newRootCIDStr} with ${allShards.length} shards (${oldShards.length} original + 1 new)`);
 
     // Check if old CID has a w3name - if so, create revision to update IPNS pointer
     const oldCIDStr = cid.toString();
@@ -968,12 +1112,10 @@ async findUploadByCID(cid) {
       return CID.parse(s.toString());
     };
 
-    const allShards = [
-      ...originalUpload.shards.map(normaliseCID),
-      normaliseCID(newShardCID)
-    ];
+    const oldShards = originalUpload?.shards ? originalUpload.shards.map(normaliseCID) : [];
+    const allShards = [...oldShards, normaliseCID(newShardCID)];
     await client.capability.upload.add(newRootCID, allShards);
-    console.error(`[rmdir] Registered new root ${newRootCIDStr} with ${allShards.length} shards`);
+    console.error(`[rmdir] Registered new root ${newRootCIDStr} with ${allShards.length} shards (${oldShards.length} original + 1 new)`);
 
     // Check if old CID has a w3name - if so, create revision to update IPNS pointer
     const oldCIDStr = cid.toString();
@@ -1135,17 +1277,18 @@ async findUploadByCID(cid) {
   async getRootCID() {
     if (!client) throw new Error('Client not initialized');
     if (!currentSpace) throw new Error('No space selected');
-    
+
     try {
       // Get the most recent upload's root CID
       const res = await client.capability.upload.list({ cursor: undefined });
-      
+
       if (res && res.results && res.results.length > 0) {
         const latestUpload = res.results[0];
         return { rootCID: latestUpload.root.toString() };
       }
-      
-      throw new Error('No uploads found');
+
+      // No uploads yet — return empty string; the backend will create a root on first write
+      return { rootCID: '' };
     } catch (error) {
       throw new Error(`Failed to get root CID: ${error.message}`);
     }
